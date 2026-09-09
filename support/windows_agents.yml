@@ -1,0 +1,112 @@
+---
+# Run standalone against a booted instance:
+#   ansible-playbook -i "$VM_IP", -e "$WINRM_EXTRA_VARS" support/windows_agents.yml
+#
+# Requires the instance's IAM role to include AmazonSSMManagedInstanceCore
+# and CloudWatchAgentServerPolicy (see iam_instance_profile in
+# ec2_boot_playbook_windows.yml) - otherwise both agents will install fine
+# but fail to register/publish metrics.
+- name: Install and enable SSM + CloudWatch agents on Windows
+  hosts: all
+  gather_facts: yes
+  vars:
+    cw_agent_msi_url: "https://s3.amazonaws.com/amazoncloudwatch-agent/windows/amd64/latest/amazon-cloudwatch-agent.msi"
+    cw_agent_msi_path: "C:\\Windows\\Temp\\amazon-cloudwatch-agent.msi"
+    cw_agent_config_path: "C:\\ProgramData\\Amazon\\AmazonCloudWatchAgent\\amazon-cloudwatch-agent.json"
+    # Minimal default config - CPU/memory/disk to the instance's own log
+    # group. Override cw_agent_config with -e for anything more specific.
+    cw_agent_config:
+      metrics:
+        namespace: "CWAgent"
+        metrics_collected:
+          Memory:
+            measurement: ["% Committed Bytes In Use"]
+          LogicalDisk:
+            measurement: ["% Free Space"]
+            resources: ["*"]
+      logs:
+        logs_collected:
+          windows_events:
+            collect_list:
+              - event_name: "System"
+                event_levels: ["ERROR", "WARNING"]
+                log_group_name: "{{ inventory_hostname }}-system"
+                log_stream_name: "{{ inventory_hostname }}"
+
+  tasks:
+    # --- SSM Agent -------------------------------------------------------
+    # Current-generation Windows Server AMIs (2016+) ship with SSM Agent
+    # preinstalled via EC2Launch, so this is mostly a "make sure it's
+    # actually running" check rather than a fresh install.
+    - name: Check SSM Agent service state
+      ansible.windows.win_service_info:
+        name: AmazonSSMAgent
+      register: ssm_service_info
+
+    - name: Download SSM Agent installer (only if service is missing)
+      ansible.windows.win_get_url:
+        url: "https://s3.{{ aws_region | default('us-east-1') }}.amazonaws.com/amazon-ssm-{{ aws_region | default('us-east-1') }}/latest/windows_amd64/AmazonSSMAgentSetup.exe"
+        dest: "C:\\Windows\\Temp\\AmazonSSMAgentSetup.exe"
+      when: ssm_service_info.exists is not defined or not ssm_service_info.exists
+
+    - name: Install SSM Agent (only if service is missing)
+      ansible.windows.win_package:
+        path: "C:\\Windows\\Temp\\AmazonSSMAgentSetup.exe"
+        arguments: "/S"
+        state: present
+      when: ssm_service_info.exists is not defined or not ssm_service_info.exists
+
+    - name: Ensure SSM Agent service is running and set to auto-start
+      ansible.windows.win_service:
+        name: AmazonSSMAgent
+        state: started
+        start_mode: auto
+
+    # --- CloudWatch Agent --------------------------------------------------
+    - name: Check whether CloudWatch Agent is already installed
+      ansible.windows.win_service_info:
+        name: AmazonCloudWatchAgent
+      register: cw_service_info
+
+    - name: Download CloudWatch Agent MSI
+      ansible.windows.win_get_url:
+        url: "{{ cw_agent_msi_url }}"
+        dest: "{{ cw_agent_msi_path }}"
+      when: cw_service_info.exists is not defined or not cw_service_info.exists
+
+    - name: Install CloudWatch Agent
+      ansible.windows.win_package:
+        path: "{{ cw_agent_msi_path }}"
+        state: present
+      when: cw_service_info.exists is not defined or not cw_service_info.exists
+
+    - name: Ensure CloudWatch Agent config directory exists
+      ansible.windows.win_file:
+        path: "C:\\ProgramData\\Amazon\\AmazonCloudWatchAgent"
+        state: directory
+
+    - name: Write CloudWatch Agent config
+      ansible.windows.win_copy:
+        content: "{{ cw_agent_config | to_nice_json }}"
+        dest: "{{ cw_agent_config_path }}"
+
+    - name: Apply CloudWatch Agent config and (re)start the service
+      ansible.windows.win_shell: >
+        & "C:\Program Files\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent-ctl.ps1"
+        -a fetch-config -m ec2 -s -c file:{{ cw_agent_config_path }}
+      register: cw_agent_apply
+      changed_when: "'success' in cw_agent_apply.stdout | lower"
+
+    - name: Ensure CloudWatch Agent service is set to auto-start
+      ansible.windows.win_service:
+        name: AmazonCloudWatchAgent
+        start_mode: auto
+
+    - name: Report agent status
+      debug:
+        msg: |
+          SSM Agent: running
+          CloudWatch Agent: installed and configured
+          (Both require the instance's IAM role to have the right policies
+          attached for registration/metrics publishing to actually succeed -
+          this playbook only handles the in-guest install/start.)

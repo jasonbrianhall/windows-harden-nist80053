@@ -46,6 +46,13 @@
     winrm_user: "Administrator"
     winrm_port: 5986
 
+    # Instance profile role - needs AmazonSSMManagedInstanceCore +
+    # CloudWatchAgentServerPolicy at minimum, plus AmazonSSMDirectoryServiceAccess
+    # (or equivalent ds:CreateComputer/ds:DescribeDirectories) if you plan to
+    # domain-join via support/windows_domain_join.yml. Required for both agents
+    # and for the domain join SSM association to work at all.
+    iam_instance_profile: "{{ lookup('env', 'IAM_INSTANCE_PROFILE') | default('', true) }}"
+
     boot_timeout: 300        # seconds to wait for WinRM to come up
     password_wait_retries: 30
     password_wait_delay: 20  # AWS can take a few minutes to generate the password
@@ -238,6 +245,7 @@
         subnet_id: "{{ resolved_subnet_id }}"
         security_groups: "{{ resolved_security_group_ids }}"
         key_name: "{{ ssh_key_name }}"
+        instance_role: "{{ iam_instance_profile if iam_instance_profile != '' else omit }}"
         network:
           assign_public_ip: "{{ assign_public_ip }}"
         volumes:

@@ -1,0 +1,89 @@
+---
+# Domain-joins the instance using the AWS-managed "seamless" join, via the
+# AWS-JoinDirectoryServiceDomain SSM document. This does NOT connect to the
+# instance over WinRM - it drives everything through the AWS API against
+# the instance's SSM Agent, so run it against localhost:
+#
+#   ansible-playbook support/windows_domain_join.yml \
+#     -e directory_id=d-xxxxxxxxxx \
+#     -e directory_name=corp.example.com \
+#     -e dns_ip_addresses='["10.0.1.10","10.0.2.10"]'
+#
+# Requirements:
+#   - SSM Agent already running (support/windows_agents.yml, or the AMI
+#     default) and the instance's IAM role has ds:CreateComputer /
+#     ds:DescribeDirectories (AmazonSSMDirectoryServiceAccess covers this).
+#   - The instance can route to the directory's DNS/domain controllers
+#     (same VPC or peered/shared, security groups permitting - this is
+#     usually already true since Managed AD sits in your VPC).
+#   - Instance ID is read from .vm_instance_id (written by
+#     ec2_boot_playbook_windows.yml) unless overridden with -e instance_id=...
+- name: Domain-join Windows instance to AWS Managed Microsoft AD
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  vars:
+    aws_region: "{{ lookup('env', 'AWS_REGION') | default('us-gov-east-1', true) }}"
+    instance_id: ""
+    directory_id: ""
+    directory_name: ""
+    dns_ip_addresses: []
+    association_wait_retries: 30
+    association_wait_delay: 15
+
+  tasks:
+    - name: Fail fast if required directory info wasn't provided
+      fail:
+        msg: "directory_id, directory_name, and dns_ip_addresses are all required (-e directory_id=... -e directory_name=... -e dns_ip_addresses='[\"ip1\",\"ip2\"]')"
+      when: directory_id == "" or directory_name == "" or (dns_ip_addresses | length == 0)
+
+    - name: Read instance ID from .vm_instance_id if not passed explicitly
+      set_fact:
+        instance_id: "{{ lookup('file', '.vm_instance_id') }}"
+      when: instance_id == ""
+
+    - name: Create SSM association for domain join
+      command: >
+        aws ssm create-association
+        --name AWS-JoinDirectoryServiceDomain
+        --targets Key=InstanceIds,Values={{ instance_id }}
+        --parameters directoryId={{ directory_id }},directoryName={{ directory_name }},dnsIpAddresses={{ dns_ip_addresses | join(',') }}
+        --region {{ aws_region }}
+        --output json
+      register: ssm_assoc_raw
+      changed_when: true
+
+    - name: Parse association ID from response
+      set_fact:
+        ssm_association_id: "{{ (ssm_assoc_raw.stdout | from_json).AssociationDescription.AssociationId }}"
+
+    - name: Wait for the domain join association to complete
+      command: >
+        aws ssm describe-association-executions
+        --association-id {{ ssm_association_id }}
+        --region {{ aws_region }}
+        --output json
+      register: assoc_status
+      until: >
+        (assoc_status.stdout | from_json).AssociationExecutions | length > 0
+        and (assoc_status.stdout | from_json).AssociationExecutions[0].Status in ['Success', 'Failed']
+      retries: "{{ association_wait_retries }}"
+      delay: "{{ association_wait_delay }}"
+      changed_when: false
+
+    - name: Fail if the domain join association did not succeed
+      fail:
+        msg: >-
+          Domain join association {{ ssm_association_id }} ended with status
+          {{ (assoc_status.stdout | from_json).AssociationExecutions[0].Status }}.
+          Check SSM Run Command / association history in the console for
+          the detailed error (common causes: no route to the directory's
+          DNS servers, or the IAM role is missing ds:CreateComputer).
+      when: (assoc_status.stdout | from_json).AssociationExecutions[0].Status != 'Success'
+
+    - name: Domain join succeeded
+      debug:
+        msg: |
+          Instance {{ instance_id }} joined {{ directory_name }} successfully.
+          The AWS-JoinDirectoryServiceDomain document reboots the instance
+          as part of the join - give it a minute before reconnecting.

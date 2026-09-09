@@ -91,14 +91,34 @@ case "$1" in
     check_stig)
         ansible-playbook -i "$VM_IP", -e "$WINRM_EXTRA_VARS" support/windows_stig_scan.yml
         ;;
+    agents)
+        ansible-playbook -i "$VM_IP", -e "$WINRM_EXTRA_VARS" -e "aws_region=$AWS_REGION" support/windows_agents.yml
+        ;;
+    domain_join)
+        if [ -z "$DIRECTORY_ID" ] || [ -z "$DIRECTORY_NAME" ] || [ -z "$DIRECTORY_DNS" ]; then
+            echo "Error: set DIRECTORY_ID, DIRECTORY_NAME, and DIRECTORY_DNS (comma-separated IPs) first"
+            exit 1
+        fi
+        # Comma-separated DIRECTORY_DNS -> JSON array for the playbook
+        DNS_JSON=$(printf '%s' "$DIRECTORY_DNS" | awk -F',' '{printf "["; for(i=1;i<=NF;i++){printf "%s\"%s\"", (i>1?",":""), $i}; printf "]"}')
+        ansible-playbook support/windows_domain_join.yml \
+            -e "aws_region=$AWS_REGION" \
+            -e "directory_id=$DIRECTORY_ID" \
+            -e "directory_name=$DIRECTORY_NAME" \
+            -e "dns_ip_addresses=$DNS_JSON"
+        ;;
     *)
-        echo "Usage: $0 [boot|hardening|baseline|check_stig]"
+        echo "Usage: $0 [boot|hardening|baseline|check_stig|agents|domain_join]"
         echo ""
         echo "  $0              - Boot the EC2 instance"
         echo "  $0 hardening    - Run Windows hardening playbook(s)"
+        echo "  $0 agents       - Install and enable SSM + CloudWatch agents"
+        echo "  $0 domain_join  - Join AWS Managed Microsoft AD (needs DIRECTORY_ID,"
+        echo "                    DIRECTORY_NAME, DIRECTORY_DNS env vars)"
         echo ""
-        echo "NOTE: support/windows_*.yml playbooks aren't included here -"
-        echo "add them the same way support/*.yml was built out for RHEL."
+        echo "NOTE: support/windows_hardening.yml, windows_baseline.yml, and"
+        echo "windows_stig_scan.yml aren't included here - add them the same"
+        echo "way support/*.yml was built out for RHEL."
         exit 1
         ;;
 esac
