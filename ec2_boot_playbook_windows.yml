@@ -1,0 +1,368 @@
+---
+# NOTE: Targets AWS GovCloud (US), same as the RHEL playbook. Windows AMIs in
+# GovCloud are still owned by "amazon" (the alias resolves in GovCloud too),
+# unlike the RHEL AMI which needed an explicit GovCloud-specific owner ID.
+#
+# Windows instances don't take an SSH key pair for login - AWS uses the key
+# pair to encrypt a randomly generated local Administrator password, which we
+# decrypt with `aws ec2 get-password-data --priv-launch-key`. So the same
+# ssh_key_name/ssh_private_key_file vars are reused here purely as the
+# "launch key" for password decryption, not for interactive SSH.
+- name: Find Windows AMI, boot EC2 instance, and get IP + Administrator password
+  hosts: localhost
+  gather_facts: yes
+  connection: local
+  vars:
+    # Configuration - customize these
+    vm_name: "win-hardened-{{ ansible_date_time.iso8601_basic_short }}"
+    aws_region: "{{ lookup('env', 'AWS_REGION') | default('us-gov-east-1', true) }}"
+    instance_type: "t3a.medium"
+    root_volume_size: 40
+
+    # AMI lookup - matched against Windows Server 2022 x86_64 images
+    ami_owner: "amazon"
+    ami_name_filter: "Windows_Server-2022-English-Full-Base-*"
+
+    # Networking - leave blank to auto-detect from the instance this play runs on
+    subnet_id: ""
+    assign_public_ip: false
+
+    # Security group - looked up by name in the target VPC; created
+    # automatically (WinRM-HTTPS-only from allowed_winrm_cidr) if it doesn't
+    # exist yet. RDP is optional and off by default.
+    security_group_name: "Allow WinRM from 10.0.0.0/8 Subnet"
+    allowed_winrm_cidr: "10.0.0.0/8"
+    open_rdp: false
+    allowed_rdp_cidr: "10.0.0.0/8"
+
+    # Launch key used only to decrypt the generated Administrator password
+    ssh_key_name: "Hardening_SSH_Key"
+    ssh_key_bits: 4096
+    ssh_key_dir: "{{ ansible_env.HOME }}/.ssh"
+    ssh_private_key_file: "{{ ssh_key_dir }}/hardening_ssh_key"
+    ssh_public_key_file: "{{ ssh_private_key_file }}.pub"
+    ssh_secret_name: "rhel10_ssh_hardening"  # shared with the RHEL playbook on purpose
+
+    winrm_user: "Administrator"
+    winrm_port: 5986
+
+    boot_timeout: 300        # seconds to wait for WinRM to come up
+    password_wait_retries: 30
+    password_wait_delay: 20  # AWS can take a few minutes to generate the password
+
+    # Hardening playbooks - set to true to run, false to skip
+    run_verification: true
+    hardening_dir: support
+
+  tasks:
+    - name: Check if .vm_ip file exists
+      stat:
+        path: ".vm_ip"
+      register: vm_ip_file
+      changed_when: false
+
+    - name: Skip VM creation if .vm_ip exists
+      meta: end_host
+      when: vm_ip_file.stat.exists
+
+    - name: Gather EC2 metadata facts for this host
+      amazon.aws.ec2_metadata_facts:
+
+    - name: Look up this instance's networking (for same-subnet default)
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ ansible_ec2_instance_id }}"
+      register: current_instance
+      when: subnet_id == ""
+
+    - name: Resolve subnet to launch into
+      set_fact:
+        resolved_subnet_id: "{{ subnet_id if subnet_id != '' else current_instance.instances[0].subnet_id }}"
+
+    - name: Get VPC for resolved subnet
+      amazon.aws.ec2_vpc_subnet_info:
+        region: "{{ aws_region }}"
+        subnet_ids:
+          - "{{ resolved_subnet_id }}"
+      register: resolved_subnet_info
+
+    - name: Find or create "{{ security_group_name }}" security group
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name }}"
+        description: "Allow WinRM (and optionally RDP) only from allowed CIDRs"
+        region: "{{ aws_region }}"
+        vpc_id: "{{ resolved_subnet_info.subnets[0].vpc_id }}"
+        rules: >-
+          {{
+            [{'proto': 'tcp', 'ports': [winrm_port], 'cidr_ip': allowed_winrm_cidr,
+              'rule_desc': 'WinRM HTTPS from ' + allowed_winrm_cidr}]
+            + ([{'proto': 'tcp', 'ports': [3389], 'cidr_ip': allowed_rdp_cidr,
+                 'rule_desc': 'RDP from ' + allowed_rdp_cidr}] if open_rdp else [])
+          }}
+        purge_rules: true
+        purge_rules_egress: false
+      register: winrm_sg
+
+    - name: Explicitly set Name tag on the security group
+      amazon.aws.ec2_tag:
+        region: "{{ aws_region }}"
+        resource: "{{ winrm_sg.group_id }}"
+        tags:
+          Name: "{{ security_group_name }}"
+        state: present
+
+    - name: Set resolved security group id
+      set_fact:
+        resolved_security_group_ids:
+          - "{{ winrm_sg.group_id }}"
+
+    - name: Ensure ~/.ssh directory exists
+      file:
+        path: "{{ ssh_key_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Check whether "{{ ssh_key_name }}" key pair already exists in AWS
+      command: >
+        aws ec2 describe-key-pairs
+        --region {{ aws_region }}
+        --key-names {{ ssh_key_name }}
+      register: aws_key_check
+      changed_when: false
+      failed_when: false
+
+    - name: Record whether the AWS key pair already exists
+      set_fact:
+        aws_key_exists: "{{ aws_key_check.rc == 0 }}"
+
+    - name: Check for existing local "{{ ssh_key_name }}" key pair
+      stat:
+        path: "{{ ssh_private_key_file }}"
+      register: local_key_stat
+
+    - name: Attempt to fetch existing secret from AWS Secrets Manager
+      set_fact:
+        existing_ssh_secret_raw: "{{ lookup('amazon.aws.secretsmanager_secret', ssh_secret_name, region=aws_region, on_missing='skip') }}"
+      no_log: true
+
+    - name: 'Extract private key from secret JSON ({"Value": "..."})'
+      set_fact:
+        existing_ssh_secret: "{{ existing_ssh_secret_raw.Value }}"
+      no_log: true
+
+    - name: Write private key from Secrets Manager (source of truth) to local file
+      copy:
+        content: "{{ existing_ssh_secret }}"
+        dest: "{{ ssh_private_key_file }}"
+        mode: '0600'
+      when: existing_ssh_secret | length > 0
+      no_log: true
+
+    - name: Regenerate public key from Secrets Manager private key
+      command: >
+        ssh-keygen -y -f {{ ssh_private_key_file }}
+      register: derived_pubkey
+      changed_when: false
+      when: existing_ssh_secret | length > 0
+
+    - name: Write derived public key file
+      copy:
+        content: "{{ derived_pubkey.stdout }} {{ ssh_key_name }}\n"
+        dest: "{{ ssh_public_key_file }}"
+        mode: '0644'
+      when: existing_ssh_secret | length > 0
+
+    - name: Fail instead of silently generating a new key pair when AWS already has one
+      fail:
+        msg: >-
+          A key pair named "{{ ssh_key_name }}" already exists in AWS
+          (region {{ aws_region }}), but no matching private key was found
+          locally ({{ ssh_private_key_file }}) or in Secrets Manager
+          ({{ ssh_secret_name }}). Refusing to generate a new key pair -
+          locate the original private key and store it in Secrets Manager,
+          or delete the AWS key pair first if it's truly orphaned.
+      when:
+        - existing_ssh_secret | length == 0
+        - not local_key_stat.stat.exists
+        - aws_key_exists | bool
+
+    - name: Generate RSA {{ ssh_key_bits }}-bit key pair (no existing secret, local key, or AWS key)
+      command: >
+        ssh-keygen -t rsa -b {{ ssh_key_bits }}
+        -f {{ ssh_private_key_file }}
+        -N ""
+        -C "{{ ssh_key_name }}"
+      when:
+        - existing_ssh_secret | length == 0
+        - not local_key_stat.stat.exists
+        - not (aws_key_exists | bool)
+
+    - name: Lock down private key permissions
+      file:
+        path: "{{ ssh_private_key_file }}"
+        mode: '0600'
+
+    - name: Import "{{ ssh_key_name }}" key pair in AWS (only if AWS doesn't already have one)
+      amazon.aws.ec2_key:
+        name: "{{ ssh_key_name }}"
+        region: "{{ aws_region }}"
+        key_material: "{{ lookup('file', ssh_public_key_file) }}"
+        state: present
+      when: not (aws_key_exists | bool)
+
+    - name: Find latest Windows Server 2022 x86_64 AMI
+      amazon.aws.ec2_ami_info:
+        region: "{{ aws_region }}"
+        owners:
+          - "{{ ami_owner }}"
+        filters:
+          name: "{{ ami_name_filter }}"
+          architecture: "x86_64"
+          root-device-type: "ebs"
+          virtualization-type: "hvm"
+          state: "available"
+      register: win_amis
+      failed_when: win_amis.images | length == 0
+
+    - name: Select most recent AMI
+      set_fact:
+        win_ami_id: "{{ (win_amis.images | sort(attribute='creation_date') | last).image_id }}"
+
+    - name: Launch EC2 instance
+      amazon.aws.ec2_instance:
+        name: "{{ vm_name }}"
+        region: "{{ aws_region }}"
+        image_id: "{{ win_ami_id }}"
+        instance_type: "{{ instance_type }}"
+        subnet_id: "{{ resolved_subnet_id }}"
+        security_groups: "{{ resolved_security_group_ids }}"
+        key_name: "{{ ssh_key_name }}"
+        network:
+          assign_public_ip: "{{ assign_public_ip }}"
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size: "{{ root_volume_size }}"
+              delete_on_termination: true
+        tags:
+          Name: "{{ vm_name }}"
+        wait: yes
+        wait_timeout: "{{ boot_timeout }}"
+        state: running
+      register: ec2_launch
+
+    - name: Determine VM IP address
+      set_fact:
+        win_vm_ip: "{{ ec2_launch.instances[0].public_ip_address | default('', true) or ec2_launch.instances[0].private_ip_address }}"
+
+    - name: Wait for Administrator password data to be available (AWS generates this on first boot)
+      command: >
+        aws ec2 get-password-data
+        --region {{ aws_region }}
+        --instance-id {{ ec2_launch.instances[0].instance_id }}
+        --priv-launch-key {{ ssh_private_key_file }}
+        --query PasswordData --output text
+      register: win_password_check
+      until: win_password_check.stdout != "" and win_password_check.stdout != "None"
+      retries: "{{ password_wait_retries }}"
+      delay: "{{ password_wait_delay }}"
+      changed_when: false
+      no_log: true
+
+    - name: Set fact for Administrator password
+      set_fact:
+        win_admin_password: "{{ win_password_check.stdout }}"
+      no_log: true
+
+    - name: Display VM information
+      debug:
+        msg: |
+          VM created successfully!
+          VM Name: {{ vm_name }}
+          Instance ID: {{ ec2_launch.instances[0].instance_id }}
+          AMI: {{ win_ami_id }}
+          IP Address: {{ win_vm_ip }}
+          Instance Type: {{ instance_type }}
+          Subnet: {{ resolved_subnet_id }}
+          WinRM user: {{ winrm_user }}
+          (Administrator password saved to .vm_admin_password, not printed here)
+
+    - name: Verify WinRM port is reachable
+      wait_for:
+        host: "{{ win_vm_ip }}"
+        port: "{{ winrm_port }}"
+        delay: 10
+        timeout: "{{ boot_timeout }}"
+      register: winrm_check
+
+    - name: Add VM to in-memory inventory
+      add_host:
+        name: "{{ vm_name }}"
+        ansible_host: "{{ win_vm_ip }}"
+        ansible_connection: winrm
+        ansible_winrm_transport: ntlm
+        ansible_winrm_server_cert_validation: ignore
+        ansible_port: "{{ winrm_port }}"
+        ansible_user: "{{ winrm_user }}"
+        ansible_password: "{{ win_admin_password }}"
+        groups: new_vms
+
+    - name: Summary
+      debug:
+        msg: |
+          Ready for hardening!
+          Connect with: ansible -i {{ win_vm_ip }}, -u {{ winrm_user }} -e ansible_connection=winrm ...
+          Run hardening playbook with:
+          ansible-playbook -i {{ win_vm_ip }}, hardening_windows.yml
+
+    - name: Save VM IP to file
+      copy:
+        content: "{{ win_vm_ip }}"
+        dest: ".vm_ip"
+      delegate_to: localhost
+
+    - name: Save VM Instance ID to file
+      copy:
+        content: "{{ ec2_launch.instances[0].instance_id }}"
+        dest: ".vm_instance_id"
+      delegate_to: localhost
+
+    - name: Save Administrator password to file
+      copy:
+        content: "{{ win_admin_password }}"
+        dest: ".vm_admin_password"
+        mode: '0600'
+      delegate_to: localhost
+      no_log: true
+
+- name: Run verification on new VM
+  hosts: new_vms
+  gather_facts: yes
+  vars:
+    run_verification: true
+    verification_playbook: verify_windows.yml
+  tasks:
+    - name: Verify WinRM connectivity
+      ansible.windows.win_ping:
+
+    - name: Verify VM is responsive
+      debug:
+        msg: "VM {{ inventory_hostname }} is online and accessible over WinRM"
+      when: run_verification
+
+    - name: Run verification playbook
+      include_tasks: "{{ verification_playbook }}"
+      ignore_errors: yes
+      when: run_verification
+
+- name: Display hardening instructions
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Output VM details for hardening
+      debug:
+        msg: |
+          VM is ready for hardening!
+          Run hardening playbooks with: ./run_windows.sh hardening
+          Or run individual playbooks from the support/ directory

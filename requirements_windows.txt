@@ -1,0 +1,2 @@
+# Add to requirements.txt for Windows targets (EC2 or KVM):
+pywinrm

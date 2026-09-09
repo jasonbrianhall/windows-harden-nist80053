@@ -1,0 +1,229 @@
+---
+# Assumes the source qcow2 is a Windows image that already has WinRM
+# configured to start on boot (e.g. via sysprep/Unattend.xml or a
+# ConfigureRemotingForAnsible-style setup baked into the image) and a
+# known local Administrator password. This playbook does not configure
+# WinRM inside the guest - it only clones the disk, boots the VM, and
+# waits for WinRM to answer.
+- name: Clone Windows KVM image, boot VM, and get IP address
+  hosts: localhost
+  gather_facts: yes
+  become: yes
+  vars:
+    # Configuration - customize these
+    source_image: "/var/lib/libvirt/images/win2022-test.qcow2"
+    target_image: "/var/lib/libvirt/images/{{ vm_name }}.qcow2"
+    vm_name: "win-hardened-{{ ansible_date_time.iso8601_basic_short }}"
+    vm_memory: 4096
+    vm_vcpus: 2
+    vm_network: "default"
+    boot_timeout: 300         # seconds to wait for WinRM to come up
+    ip_poll_interval: 5       # seconds between IP address checks
+    ip_poll_retries: 60       # number of times to check for IP
+
+    winrm_user: "Administrator"
+    winrm_password: "{{ lookup('env', 'WIN_ADMIN_PASSWORD') }}"
+    winrm_port: 5986
+    winrm_transport: ntlm
+
+    # Hardening playbooks - set to true to run, false to skip
+    run_verification: true
+    hardening_dir: support
+
+  tasks:
+    - name: Check if .vm_ip file exists
+      stat:
+        path: ".vm_ip"
+      register: vm_ip_file
+      changed_when: false
+
+    - name: Skip VM creation if .vm_ip exists
+      meta: end_host
+      when: vm_ip_file.stat.exists
+
+    - name: Fail early if no Administrator password was provided
+      fail:
+        msg: "Set WIN_ADMIN_PASSWORD (env var) to the local Administrator password baked into {{ source_image }}."
+      when: winrm_password == ""
+
+    - name: Check if source image exists
+      stat:
+        path: "{{ source_image }}"
+      register: source_stat
+      failed_when: not source_stat.stat.exists
+
+    - name: Create copy of base image
+      command: "cp {{ source_image }} {{ target_image }}"
+      register: copy_result
+      changed_when: copy_result.rc == 0
+
+    - name: Define VM from XML template
+      community.libvirt.virt:
+        name: "{{ vm_name }}"
+        command: define
+        xml: |
+          <domain type='kvm'>
+            <name>{{ vm_name }}</name>
+            <memory unit='KiB'>{{ vm_memory * 1024 }}</memory>
+            <currentMemory unit='KiB'>{{ vm_memory * 1024 }}</currentMemory>
+            <vcpu placement='static'>{{ vm_vcpus }}</vcpu>
+            <os>
+              <type arch='x86_64' machine='pc-i440fx-10.2'>hvm</type>
+              <boot dev='hd'/>
+            </os>
+            <cpu mode='host-passthrough' check='none' migratable='on'/>
+            <clock offset='localtime'>
+              <timer name='hypervclock' present='yes'/>
+            </clock>
+            <on_poweroff>destroy</on_poweroff>
+            <on_reboot>restart</on_reboot>
+            <on_crash>destroy</on_crash>
+            <devices>
+              <emulator>/usr/bin/qemu-system-x86_64</emulator>
+              <disk type='file' device='disk'>
+                <driver name='qemu' type='qcow2'/>
+                <source file='{{ target_image }}'/>
+                <target dev='vda' bus='virtio'/>
+                <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0'/>
+              </disk>
+              <controller type='usb' index='0' model='piix3-uhci'>
+                <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x2'/>
+              </controller>
+              <controller type='pci' index='0' model='pci-root'/>
+              <controller type='virtio-serial' index='0'>
+                <address type='pci' domain='0x0000' bus='0x00' slot='0x04' function='0x0'/>
+              </controller>
+              <interface type='network'>
+                <source network='{{ vm_network }}'/>
+                <model type='virtio'/>
+              </interface>
+              <console type='pty'>
+                <target type='virtio' port='0'/>
+              </console>
+              <channel type='spicevmc'>
+                <target type='virtio' name='com.redhat.spice.0'/>
+                <address type='virtio-serial' controller='0' bus='0' port='1'/>
+              </channel>
+              <input type='mouse' bus='ps2'/>
+              <input type='keyboard' bus='ps2'/>
+              <graphics type='spice' autoport='yes'>
+                <listen type='address'/>
+              </graphics>
+              <audio id='1' type='spice'/>
+              <video>
+                <model type='qxl' vram='16384' heads='1' primary='yes'/>
+                <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+              </video>
+              <memballoon model='virtio'>
+                <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+              </memballoon>
+            </devices>
+          </domain>
+
+    - name: Start the VM
+      community.libvirt.virt:
+        name: "{{ vm_name }}"
+        state: running
+
+    - name: Wait for VM to be running
+      community.libvirt.virt:
+        name: "{{ vm_name }}"
+        command: status
+      register: vm_status
+      until: vm_status.status == 'running'
+      retries: 10
+      delay: 2
+
+    - name: Wait for network interface to come up (Windows boots slower than RHEL)
+      pause:
+        seconds: 30
+
+    - name: Get VM IP address
+      block:
+        - name: Query VM IP address via libvirt
+          shell: |
+            virsh domifaddr {{ vm_name }} | grep ipv4 | awk '{print $4}' | cut -d'/' -f1
+          register: vm_ip_result
+          until: vm_ip_result.stdout != ""
+          retries: "{{ ip_poll_retries }}"
+          delay: "{{ ip_poll_interval }}"
+          changed_when: false
+
+        - name: Display VM information
+          debug:
+            msg: |
+              VM created successfully!
+              VM Name: {{ vm_name }}
+              Image: {{ target_image }}
+              IP Address: {{ vm_ip_result.stdout }}
+              Memory: {{ vm_memory }} MiB
+              vCPUs: {{ vm_vcpus }}
+
+        - name: Set fact for VM IP
+          set_fact:
+            win_vm_ip: "{{ vm_ip_result.stdout }}"
+
+    - name: Verify WinRM port is reachable
+      wait_for:
+        host: "{{ win_vm_ip }}"
+        port: "{{ winrm_port }}"
+        delay: 10
+        timeout: "{{ boot_timeout }}"
+      register: winrm_check
+
+    - name: Add VM to in-memory inventory
+      add_host:
+        name: "{{ vm_name }}"
+        ansible_host: "{{ win_vm_ip }}"
+        ansible_connection: winrm
+        ansible_winrm_transport: "{{ winrm_transport }}"
+        ansible_winrm_server_cert_validation: ignore
+        ansible_port: "{{ winrm_port }}"
+        ansible_user: "{{ winrm_user }}"
+        ansible_password: "{{ winrm_password }}"
+        groups: new_vms
+
+    - name: Summary
+      debug:
+        msg: |
+          Ready for hardening!
+          Connect with: ansible -i {{ win_vm_ip }}, -u {{ winrm_user }} -e ansible_connection=winrm ...
+          Run hardening playbook with:
+          ansible-playbook -i {{ win_vm_ip }}, hardening_windows.yml
+
+    - name: Save VM IP to file
+      copy:
+        content: "{{ win_vm_ip }}"
+        dest: ".vm_ip"
+      delegate_to: localhost
+
+- name: Run verification on new VM
+  hosts: new_vms
+  gather_facts: yes
+  vars:
+    verification_playbook: verify_windows.yml
+    run_verification: true
+  tasks:
+    - name: Verify WinRM connectivity
+      ansible.windows.win_ping:
+
+    - name: Verify VM is responsive
+      debug:
+        msg: "VM {{ inventory_hostname }} is online and accessible over WinRM"
+      when: run_verification
+
+    - name: Run verification playbook
+      include_tasks: "{{ verification_playbook }}"
+      ignore_errors: yes
+      when: run_verification
+
+- name: Display hardening instructions
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Output VM details for hardening
+      debug:
+        msg: |
+          VM is ready for hardening!
+          Run hardening playbooks with: ./run_windows.sh hardening
+          Or run individual playbooks from the support/ directory
