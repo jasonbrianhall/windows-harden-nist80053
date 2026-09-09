@@ -7,3 +7,11 @@ New-NetFirewallRule -Name WinRM-HTTP -DisplayName "WinRM HTTP" -Protocol TCP -Lo
 
 net user administrator /active:yes
 net user administrator Changeme123!
+
+# Check connection
+
+python3 -c "
+import winrm
+s = winrm.Session('http://VM_IP:5985/wsman', auth=('Administrator','Changeme123!'), transport='basic')
+print(s.run_cmd('hostname').std_out)
+"
