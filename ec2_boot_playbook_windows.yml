@@ -359,10 +359,17 @@
         msg: "VM {{ inventory_hostname }} is online and accessible over WinRM"
       when: run_verification
 
+    - name: Check whether a verification playbook exists
+      stat:
+        path: "{{ verification_playbook }}"
+      register: verification_playbook_stat
+      delegate_to: localhost
+      become: no
+
     - name: Run verification playbook
       include_tasks: "{{ verification_playbook }}"
       ignore_errors: yes
-      when: run_verification
+      when: run_verification and verification_playbook_stat.stat.exists
 
 - name: Display hardening instructions
   hosts: localhost
