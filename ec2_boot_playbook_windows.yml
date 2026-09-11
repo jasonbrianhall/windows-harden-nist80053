@@ -57,6 +57,23 @@
     password_wait_retries: 30
     password_wait_delay: 20  # AWS can take a few minutes to generate the password
 
+    # Explicit WinRM-HTTPS setup on first boot, instead of relying on
+    # EC2Launch v2's default listener config (which is AMI-dependent).
+    winrm_user_data: |
+      <powershell>
+      winrm quickconfig -q
+      winrm set winrm/config/service/auth '@{Basic="true"}'
+
+      $existing = winrm enumerate winrm/config/listener
+      if ($existing -notmatch "Transport = HTTPS") {
+          $cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation Cert:\LocalMachine\My
+          $thumbprint = $cert.Thumbprint
+          winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME`";CertificateThumbprint=`"$thumbprint`"}"
+      }
+
+      New-NetFirewallRule -Name WinRM-HTTPS -DisplayName "WinRM HTTPS" -Protocol TCP -LocalPort {{ winrm_port }} -Action Allow -ErrorAction SilentlyContinue
+      </powershell>
+
     # Hardening playbooks - set to true to run, false to skip
     run_verification: true
     hardening_dir: support
@@ -248,6 +265,7 @@
         instance_role: "{{ iam_instance_profile if iam_instance_profile != '' else omit }}"
         network:
           assign_public_ip: "{{ assign_public_ip }}"
+        user_data: "{{ winrm_user_data }}"
         volumes:
           - device_name: /dev/sda1
             ebs:
