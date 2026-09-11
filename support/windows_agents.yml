@@ -10,7 +10,12 @@
   hosts: all
   gather_facts: yes
   vars:
-    cw_agent_msi_url: "https://s3.amazonaws.com/amazoncloudwatch-agent/windows/amd64/latest/amazon-cloudwatch-agent.msi"
+    aws_region: "{{ aws_region | default(lookup('env', 'AWS_REGION')) | default('us-east-1', true) }}"
+    # Commercial regions share one global bucket ("amazoncloudwatch-agent").
+    # GovCloud (and China) regions each have their own region-suffixed
+    # bucket instead - there's no global one there.
+    cw_agent_bucket: "{{ 'amazoncloudwatch-agent-' + aws_region if aws_region.startswith('us-gov-') or aws_region.startswith('cn-') else 'amazoncloudwatch-agent' }}"
+    cw_agent_msi_url: "https://s3.{{ aws_region }}.amazonaws.com/{{ cw_agent_bucket }}/windows/amd64/latest/amazon-cloudwatch-agent.msi"
     cw_agent_msi_path: "C:\\Windows\\Temp\\amazon-cloudwatch-agent.msi"
     cw_agent_config_path: "C:\\ProgramData\\Amazon\\AmazonCloudWatchAgent\\amazon-cloudwatch-agent.json"
     # Minimal default config - CPU/memory/disk to the instance's own log
