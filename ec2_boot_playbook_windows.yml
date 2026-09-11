@@ -61,6 +61,11 @@
     # EC2Launch v2's default listener config (which is AMI-dependent).
     winrm_user_data: |
       <powershell>
+      # EC2 NICs often come up as "Public" under NLA, and winrm quickconfig
+      # refuses to add its firewall exception on a Public profile - force
+      # every interface to Private first.
+      Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private
+
       winrm quickconfig -q
       winrm set winrm/config/service/auth '@{Basic="true"}'
 
@@ -71,7 +76,7 @@
           winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME`";CertificateThumbprint=`"$thumbprint`"}"
       }
 
-      New-NetFirewallRule -Name WinRM-HTTPS -DisplayName "WinRM HTTPS" -Protocol TCP -LocalPort {{ winrm_port }} -Action Allow -ErrorAction SilentlyContinue
+      New-NetFirewallRule -Name WinRM-HTTPS -DisplayName "WinRM HTTPS" -Protocol TCP -LocalPort {{ winrm_port }} -Action Allow -Profile Any -ErrorAction SilentlyContinue
       </powershell>
 
     # Hardening playbooks - set to true to run, false to skip
@@ -259,12 +264,13 @@
         region: "{{ aws_region }}"
         image_id: "{{ win_ami_id }}"
         instance_type: "{{ instance_type }}"
-        subnet_id: "{{ resolved_subnet_id }}"
-        security_groups: "{{ resolved_security_group_ids }}"
         key_name: "{{ ssh_key_name }}"
         instance_role: "{{ iam_instance_profile if iam_instance_profile != '' else omit }}"
         network:
-          assign_public_ip: "{{ assign_public_ip }}"
+          interfaces:
+            - subnet_id: "{{ resolved_subnet_id }}"
+              groups: "{{ resolved_security_group_ids }}"
+              assign_public_ip: "{{ assign_public_ip }}"
         user_data: "{{ winrm_user_data }}"
         volumes:
           - device_name: /dev/sda1
